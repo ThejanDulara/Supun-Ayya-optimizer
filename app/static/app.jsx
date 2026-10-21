@@ -32,6 +32,7 @@ const App = () => {
     const [results, setResults] = useState(null);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState(null);
+    const [roundedOverrides, setRoundedOverrides] = useState({});
 
     const generateId = () => Math.random().toString(36).substr(2, 9);
 
@@ -183,6 +184,7 @@ const App = () => {
                     total_actual_duration: data.total_actual_duration,
                     mapping: resultMapping
                 });
+                setRoundedOverrides({});
             } else {
                 setError(data.error || 'Failed to optimize');
             }
@@ -193,24 +195,24 @@ const App = () => {
         }
     };
 
-    // Largest Remainder Method: round spots per brand so rounded sum == round(exact sum)
-    const roundedSpotsMap = useMemo(() => {
+    // 1. Initial Largest Remainder Method per brand + 2. Duration Balancing
+    // Balances total rounded duration to match target duration (allowing up to 10s excess)
+    const autoBalancedMap = useMemo(() => {
         if (!results) return {};
         const map = {};
 
+        // 1. Initial Largest Remainder Method per brand
         brands.forEach(b => {
             const varIds = b.variations.map(v => v.id);
             const spotValues = varIds.map(id => results.mapping[id]?.spots ?? 0);
             const exactSum = spotValues.reduce((s, x) => s + x, 0);
             const target = Math.round(exactSum);
 
-            // Floor each, compute remainders
             const floored = spotValues.map(x => Math.floor(x));
             const remainders = spotValues.map((x, i) => ({ idx: i, rem: x - floored[i] }));
             let flooredSum = floored.reduce((s, x) => s + x, 0);
             let deficit = target - flooredSum;
 
-            // Give +1 to those with highest remainders
             remainders.sort((a, b) => b.rem - a.rem);
             remainders.forEach((r, rank) => {
                 floored[r.idx] += rank < deficit ? 1 : 0;
@@ -218,8 +220,128 @@ const App = () => {
 
             varIds.forEach((id, i) => { map[id] = floored[i]; });
         });
+
+        const targetDur = results.total_actual_duration || Number(totalDuration) || 0;
+        const MAX_EXCESS = 10; // Up to 10 seconds excess allowed
+
+        // Compute current rounded duration
+        let currentDur = flatRows.reduce((sum, r) => sum + (map[r.rowId] || 0) * (Number(r.duration) || 0), 0);
+
+        // If greater than Total Optimized Duration + 10s: reduce spots from greatest possible place
+        let safetyCounter = 0;
+        while (currentDur > targetDur + MAX_EXCESS && safetyCounter < 100) {
+            safetyCounter++;
+            const eligible = flatRows.filter(r => (map[r.rowId] || 0) > 0);
+            if (eligible.length === 0) break;
+
+            eligible.sort((a, b) => {
+                const countA = map[a.rowId] || 0;
+                const countB = map[b.rowId] || 0;
+                if (countB !== countA) return countB - countA; // Greatest spot count first
+
+                const exactA = results.mapping[a.rowId]?.spots || 0;
+                const exactB = results.mapping[b.rowId]?.spots || 0;
+                const overA = countA - exactA;
+                const overB = countB - exactB;
+                if (overB !== overA) return overB - overA; // Highest over-allocation next
+
+                return (Number(b.duration) || 0) - (Number(a.duration) || 0);
+            });
+
+            const chosen = eligible[0];
+            map[chosen.rowId] -= 1;
+            currentDur -= (Number(chosen.duration) || 0);
+        }
+
+        // If less than Total Optimized Duration: add anywhere that can fit into available duration
+        safetyCounter = 0;
+        while (currentDur < targetDur && safetyCounter < 100) {
+            safetyCounter++;
+            const maxAllowed = targetDur + MAX_EXCESS;
+            const remaining = maxAllowed - currentDur;
+
+            // Only consider variations whose duration fits within the remaining allowed budget
+            const eligible = flatRows.filter(r => (Number(r.duration) || 0) <= remaining);
+            if (eligible.length === 0) break;
+
+            eligible.sort((a, b) => {
+                const countA = map[a.rowId] || 0;
+                const countB = map[b.rowId] || 0;
+                const exactA = results.mapping[a.rowId]?.spots || 0;
+                const exactB = results.mapping[b.rowId]?.spots || 0;
+                const underA = exactA - countA;
+                const underB = exactB - countB;
+                if (underB !== underA) return underB - underA; // Most under-allocated first
+
+                return (Number(b.duration) || 0) - (Number(a.duration) || 0);
+            });
+
+            const chosen = eligible[0];
+            map[chosen.rowId] += 1;
+            currentDur += (Number(chosen.duration) || 0);
+        }
+
         return map;
-    }, [results, brands]);
+    }, [results, brands, flatRows, totalDuration]);
+
+    // Active rounded spots map (combines auto-balance with user adjustments)
+    const roundedSpotsMap = useMemo(() => {
+        const finalMap = { ...autoBalancedMap };
+        Object.keys(roundedOverrides).forEach(key => {
+            if (roundedOverrides[key] !== undefined) {
+                finalMap[key] = roundedOverrides[key];
+            }
+        });
+        return finalMap;
+    }, [autoBalancedMap, roundedOverrides]);
+
+    // Manually tweak rounded spots for a variation
+    const adjustSpot = (rowId, delta) => {
+        setRoundedOverrides(prev => {
+            const current = roundedSpotsMap[rowId] ?? 0;
+            const nextVal = Math.max(0, current + delta);
+            return { ...prev, [rowId]: nextVal };
+        });
+    };
+
+    // Reset all manual overrides back to algorithmically balanced spots
+    const handleResetToAutoBalance = () => {
+        setRoundedOverrides({});
+    };
+
+    // Calculate totals for spots and durations (sum product of duration and spots)
+    const totals = useMemo(() => {
+        if (!results) return null;
+        let optSpots = 0;
+        let roundSpots = 0;
+        let optDur = 0;
+        let roundDur = 0;
+
+        flatRows.forEach(row => {
+            const res = results.mapping[row.rowId];
+            const rSpots = roundedSpotsMap[row.rowId] ?? 0;
+            const dur = Number(row.duration) || 0;
+
+            if (res) {
+                optSpots += res.spots || 0;
+                optDur += (res.spots || 0) * dur;
+            }
+            roundSpots += rSpots;
+            roundDur += rSpots * dur;
+        });
+
+        const diff = Number((roundDur - optDur).toFixed(2));
+
+        return {
+            optimizedSpots: optSpots,
+            roundedSpots: roundSpots,
+            optimizedDuration: optDur,
+            roundedDuration: roundDur,
+            actualDuration: optDur,
+            durationDiff: diff,
+            isBalanced: diff <= 10 && diff >= -10
+        };
+    }, [results, flatRows, roundedSpotsMap]);
 
     return (
         <div>
@@ -350,8 +472,25 @@ const App = () => {
 
                 {/* 3. Final Preview & Optimization Table */}
                 <div className="card">
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
-                        <h3 style={{color: 'var(--text-primary)', margin: 0}}>3. Final Preview & Calculation</h3>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem', flexWrap: 'wrap', gap: '1rem' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap' }}>
+                            <h3 style={{color: 'var(--text-primary)', margin: 0}}>3. Final Preview & Calculation</h3>
+                            {results && totals && (
+                                totals.durationDiff > 10 ? (
+                                    <span className="balance-badge balance-badge-danger">
+                                        ⚠ Exceeds Target by +{totals.durationDiff.toFixed(1)}s (Max +10s allowed)
+                                    </span>
+                                ) : totals.durationDiff < 0 ? (
+                                    <span className="balance-badge balance-badge-warning">
+                                        ℹ Under Target by {Math.abs(totals.durationDiff).toFixed(1)}s
+                                    </span>
+                                ) : (
+                                    <span className="balance-badge balance-badge-success">
+                                        ✓ Duration Balanced ({totals.durationDiff >= 0 ? `+${totals.durationDiff.toFixed(1)}s` : `${totals.durationDiff.toFixed(1)}s`})
+                                    </span>
+                                )
+                            )}
+                        </div>
                         <div style={{ display: 'flex', alignItems: 'center', gap: '1.5rem' }}>
                             <div className="input-group">
                                 <label>Total Available Duration (s):</label>
@@ -409,8 +548,27 @@ const App = () => {
                                             <td className="result-val highlight-val">
                                                 {res ? res.spots.toFixed(2) : '-'}
                                             </td>
-                                            <td className="result-val" style={{ color: 'var(--success)', fontWeight: 700 }}>
-                                                {roundedSpotsMap[row.rowId] !== undefined ? roundedSpotsMap[row.rowId] : '-'}
+                                            <td className="result-val" style={{ color: 'var(--success)', fontWeight: 700, whiteSpace: 'nowrap' }}>
+                                                {results ? (
+                                                    <div style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
+                                                        <button 
+                                                            type="button" 
+                                                            className="spot-adjust-btn" 
+                                                            onClick={() => adjustSpot(row.rowId, -1)}
+                                                            disabled={(roundedSpotsMap[row.rowId] || 0) <= 0}
+                                                            title="Decrease 1 spot"
+                                                        >−</button>
+                                                        <span style={{ minWidth: '20px', textAlign: 'center' }}>
+                                                            {roundedSpotsMap[row.rowId] !== undefined ? roundedSpotsMap[row.rowId] : '-'}
+                                                        </span>
+                                                        <button 
+                                                            type="button" 
+                                                            className="spot-adjust-btn" 
+                                                            onClick={() => adjustSpot(row.rowId, 1)}
+                                                            title="Increase 1 spot"
+                                                        >+</button>
+                                                    </div>
+                                                ) : '-'}
                                             </td>
                                             <td className="result-val">
                                                 {res ? res.actual_duration.toFixed(2) : '-'}
@@ -431,12 +589,96 @@ const App = () => {
                                     );
                                 })}
                             </tbody>
+                            {flatRows.length > 0 && (
+                                <tfoot>
+                                    <tr className="table-total-row">
+                                        <td colSpan={4} style={{ textAlign: 'right', fontWeight: 700, letterSpacing: '0.05em' }}>
+                                            Total:
+                                        </td>
+                                        <td className="result-val highlight-val" style={{ fontWeight: 800 }}>
+                                            <div>{totals ? totals.optimizedSpots.toFixed(2) : '-'}</div>
+                                            {totals && (
+                                                <div style={{ fontSize: '0.78rem', color: 'var(--accent-primary)', fontWeight: 600, marginTop: '2px' }}>
+                                                    {totals.optimizedDuration.toFixed(2)}s
+                                                </div>
+                                            )}
+                                        </td>
+                                        <td className="result-val" style={{ color: 'var(--success)', fontWeight: 800 }}>
+                                            <div>{totals ? totals.roundedSpots : '-'}</div>
+                                            {totals && (
+                                                <div style={{ fontSize: '0.78rem', color: 'var(--success)', fontWeight: 600, marginTop: '2px' }}>
+                                                    {totals.roundedDuration.toFixed(2)}s
+                                                </div>
+                                            )}
+                                        </td>
+                                        <td className="result-val" style={{ fontWeight: 800 }}>
+                                            {totals ? `${totals.optimizedDuration.toFixed(2)}s` : '-'}
+                                        </td>
+                                        <td className="result-val highlight-val" style={{ fontWeight: 800 }}>
+                                            {totals ? (
+                                                <>
+                                                    {totals.optimizedDuration.toFixed(2)}s
+                                                    <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', fontWeight: 500, marginLeft: '4px' }}>
+                                                        / {totalDuration > 0 ? ((totals.optimizedDuration / totalDuration) * 100).toFixed(1) : 0}%
+                                                    </span>
+                                                </>
+                                            ) : '-'}
+                                        </td>
+                                    </tr>
+                                </tfoot>
+                            )}
                         </table>
-                        {results && (
+                        {results && totals && (
                             <div className="summary-bar">
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginRight: 'auto', flexWrap: 'wrap' }}>
+                                    {totals.durationDiff > 10 ? (
+                                        <span className="balance-badge balance-badge-danger">
+                                            ⚠ Exceeds by +{totals.durationDiff.toFixed(1)}s (Max +10s allowed)
+                                        </span>
+                                    ) : totals.durationDiff < 0 ? (
+                                        <span className="balance-badge balance-badge-warning">
+                                            ℹ Under by {Math.abs(totals.durationDiff).toFixed(1)}s
+                                        </span>
+                                    ) : (
+                                        <span className="balance-badge balance-badge-success">
+                                            ✓ Duration Balanced ({totals.durationDiff >= 0 ? `+${totals.durationDiff.toFixed(1)}s` : `${totals.durationDiff.toFixed(1)}s`})
+                                        </span>
+                                    )}
+                                    <button
+                                        type="button"
+                                        className="btn-sm btn-auto-balance"
+                                        onClick={handleResetToAutoBalance}
+                                        title="Automatically balance rounded spots to match target duration"
+                                    >
+                                        {Object.keys(roundedOverrides).length > 0 ? 'Reset to Auto-Balance' : 'Re-balance'}
+                                    </button>
+                                </div>
+
+                                <div className="summary-stat">
+                                    <span>Total Optimized Spots</span>
+                                    <strong style={{ color: 'var(--accent-primary)' }}>{totals.optimizedSpots.toFixed(2)}</strong>
+                                </div>
                                 <div className="summary-stat">
                                     <span>Total Optimized Duration</span>
-                                    <strong>{results.total_actual_duration.toFixed(2)}s / {totalDuration}s</strong>
+                                    <strong style={{ color: 'var(--accent-primary)' }}>
+                                        {totals.optimizedDuration.toFixed(2)}s
+                                        <span style={{ fontSize: '0.8rem', fontWeight: 500, color: 'var(--text-secondary)', marginLeft: '4px' }}>
+                                            / {totalDuration}s
+                                        </span>
+                                    </strong>
+                                </div>
+                                <div className="summary-stat">
+                                    <span>Total Rounded Spots</span>
+                                    <strong style={{ color: 'var(--success)' }}>{totals.roundedSpots}</strong>
+                                </div>
+                                <div className="summary-stat">
+                                    <span>Total Rounded Duration</span>
+                                    <strong style={{ color: 'var(--success)' }}>
+                                        {totals.roundedDuration.toFixed(2)}s
+                                        <span style={{ fontSize: '0.8rem', fontWeight: 500, color: 'var(--text-secondary)', marginLeft: '4px' }}>
+                                            / {totalDuration}s
+                                        </span>
+                                    </strong>
                                 </div>
                             </div>
                         )}
